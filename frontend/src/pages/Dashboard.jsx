@@ -94,7 +94,7 @@ const Dashboard = () => {
 
   const handleLogout = () => {
     removeAuthToken();
-    navigate('/signin');
+    window.location.href = '/signin';
   };
 
   if (loading) {

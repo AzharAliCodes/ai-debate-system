@@ -1,5 +1,6 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -12,11 +13,16 @@ from datetime import datetime, timezone, timedelta
 from google import genai
 from google.genai import types as genai_types
 from pydantic import BaseModel, EmailStr
-from typing import List, Optional
+from typing import List, Optional, Dict, Set
 import uuid
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 import json
+import anyio
+import aiofiles
+import pyttsx3
+from gtts import gTTS
+import threading
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -39,9 +45,55 @@ security = HTTPBearer()
 app = FastAPI(title="DebateIQ - AI Debate Judge Platform")
 api_router = APIRouter(prefix="/api")
 
+# Create static directories
+os.makedirs(ROOT_DIR / "static" / "audio", exist_ok=True)
+
+# Initialize Faster Whisper with fallback for system DLL load blocks
+whisper_model = None
+try:
+    from faster_whisper import WhisperModel
+    logging.info("Initializing Faster Whisper base model on CPU...")
+    try:
+        whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+    except Exception as e:
+        logging.warning(f"Failed to load Whisper base with int8: {e}. Trying float32...")
+        try:
+            whisper_model = WhisperModel("base", device="cpu", compute_type="float32")
+        except Exception as e2:
+            logging.error(f"Failed to load Whisper base with float32: {e2}")
+except Exception as e:
+    logging.error(f"Failed to import or initialize WhisperModel (Application Control Policy might be blocking ctranslate2 DLLs): {e}")
+
+# ============= WEBSOCKET MANAGER =============
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, Set[WebSocket]] = {}
+
+    async def connect(self, room_id: str, websocket: WebSocket):
+        await websocket.accept()
+        if room_id not in self.active_connections:
+            self.active_connections[room_id] = set()
+        self.active_connections[room_id].add(websocket)
+
+    def disconnect(self, room_id: str, websocket: WebSocket):
+        if room_id in self.active_connections:
+            self.active_connections[room_id].discard(websocket)
+            if not self.active_connections[room_id]:
+                del self.active_connections[room_id]
+
+    async def broadcast(self, room_id: str, message: dict):
+        if room_id in self.active_connections:
+            for connection in list(self.active_connections[room_id]):
+                try:
+                    await connection.send_json(message)
+                except Exception:
+                    self.disconnect(room_id, connection)
+
+manager = ConnectionManager()
+
 # ============= PYDANTIC MODELS =============
 
-# --- Auth ---
 class UserSignUp(BaseModel):
     name: str
     email: EmailStr
@@ -51,7 +103,6 @@ class UserSignIn(BaseModel):
     email: EmailStr
     password: str
 
-# --- Debate ---
 class CreateRoomRequest(BaseModel):
     topic: str
     sideALabel: Optional[str] = "Side A"
@@ -72,6 +123,11 @@ class RoomActionRequest(BaseModel):
 
 class EvaluateRequest(BaseModel):
     roomId: str
+
+class MicActionRequest(BaseModel):
+    roomId: str
+    side: str
+    participantName: str
 
 # ============= UTILITY FUNCTIONS =============
 
@@ -104,6 +160,37 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 def generate_room_code() -> str:
     chars = string.ascii_uppercase + string.digits
     return ''.join(rand_module.choices(chars, k=6))
+
+def transcribe_audio(audio_path: str) -> str:
+    if whisper_model is None:
+        logging.warning("Whisper model is not initialized. Skipping local transcription.")
+        return ""
+    segments, info = whisper_model.transcribe(audio_path)
+    full_text = ""
+    for segment in segments:
+        full_text += segment.text + " "
+    return full_text.strip()
+
+def generate_tts_sync(text: str, output_path: str):
+    try:
+        logging.info(f"Generating TTS using pyttsx3 for text: {text[:50]}")
+        engine = pyttsx3.init()
+        engine.save_to_file(text, output_path)
+        engine.runAndWait()
+        del engine
+    except Exception as e:
+        logging.error(f"pyttsx3 failed: {e}. Falling back to gTTS...")
+        try:
+            # Fallback to gTTS (Google TTS)
+            tts = gTTS(text=text, lang='en')
+            # Save it as .mp3 but we rename it or keep it .mp3
+            mp3_path = output_path.replace(".wav", ".mp3")
+            tts.save(mp3_path)
+        except Exception as ge:
+            logging.error(f"gTTS fallback also failed: {ge}")
+
+async def generate_tts_audio(text: str, output_path: str):
+    await anyio.to_thread.run_sync(generate_tts_sync, text, output_path)
 
 # ============= AUTH ROUTES =============
 
@@ -168,6 +255,7 @@ async def create_room(data: CreateRoomRequest, current_user: dict = Depends(get_
         }],
         "status": "waiting",
         "evaluated": False,
+        "micHolder": None,
         "createdAt": datetime.now(timezone.utc).isoformat()
     }
     await db.debate_rooms.insert_one(room_doc)
@@ -198,6 +286,11 @@ async def join_room(data: JoinRoomRequest, current_user: dict = Depends(get_curr
         "joinedAt": datetime.now(timezone.utc).isoformat()
     }
     await db.debate_rooms.update_one({"id": room["id"]}, {"$push": {"participants": participant}})
+    # Broadcast to room so Person A sees the new participant in real-time
+    await manager.broadcast(room["id"], {
+        "type": "state_update",
+        "status": room.get("status", "waiting")
+    })
     return {"success": True, "roomId": room["id"]}
 
 @api_router.get("/debate/room/{room_id}")
@@ -221,9 +314,17 @@ async def start_room(data: RoomActionRequest, current_user: dict = Depends(get_c
             "startedAt": datetime.now(timezone.utc).isoformat(),
             "currentTurn": "A",
             "turnsUsed": {"A": 0, "B": 0},
-            "maxTurnsPerSide": 2
+            "maxTurnsPerSide": 5,
+            "micHolder": None
         }}
     )
+    # Broadcast start
+    await manager.broadcast(data.roomId, {
+        "type": "state_update",
+        "micHolder": None,
+        "turnsUsed": {"A": 0, "B": 0},
+        "status": "live"
+    })
     return {"success": True}
 
 @api_router.post("/debate/end-room")
@@ -235,25 +336,200 @@ async def end_room(data: RoomActionRequest, current_user: dict = Depends(get_cur
         raise HTTPException(status_code=403, detail="Only the room creator can end the debate")
     await db.debate_rooms.update_one(
         {"id": data.roomId},
-        {"$set": {"status": "completed", "endedAt": datetime.now(timezone.utc).isoformat()}}
+        {"$set": {"status": "completed", "endedAt": datetime.now(timezone.utc).isoformat(), "micHolder": None}}
     )
+    # Broadcast end
+    await manager.broadcast(data.roomId, {
+        "type": "state_update",
+        "micHolder": None,
+        "status": "completed"
+    })
     return {"success": True}
 
 @api_router.get("/debate/my-rooms")
 async def get_my_rooms(current_user: dict = Depends(get_current_user)):
     rooms = await db.debate_rooms.find(
-        {"createdBy": current_user["id"]}, {"_id": 0}
+        {"$or": [
+            {"createdBy": current_user["id"]},
+            {"participants.userId": current_user["id"]}
+        ]}, {"_id": 0}
     ).sort("createdAt", -1).to_list(50)
     return rooms
 
 @api_router.get("/debate/public-rooms")
 async def get_public_rooms(current_user: dict = Depends(get_current_user)):
     rooms = await db.debate_rooms.find(
-        {"createdBy": {"$ne": current_user["id"]}}, {"_id": 0}
+        {"createdBy": {"$ne": current_user["id"]}, "participants.userId": {"$ne": current_user["id"]}}, {"_id": 0}
     ).sort("createdAt", -1).limit(20).to_list(20)
     return rooms
 
-# ============= TRANSCRIPT ROUTES =============
+# ============= MIC CONTROL API =============
+
+@api_router.post("/debate/mic/acquire")
+async def acquire_mic(data: MicActionRequest, current_user: dict = Depends(get_current_user)):
+    room = await db.debate_rooms.find_one({"id": data.roomId})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room["status"] != "live":
+        raise HTTPException(status_code=400, detail="Debate is not live.")
+    
+    current_holder = room.get("micHolder")
+    if current_holder and current_holder != data.side:
+        raise HTTPException(status_code=400, detail="Microphone is currently locked by the other participant.")
+        
+    turns_used = room.get("turnsUsed", {"A": 0, "B": 0})
+    max_turns = room.get("maxTurnsPerSide", 5)
+    if turns_used.get(data.side, 0) >= max_turns:
+        raise HTTPException(status_code=400, detail="You have exhausted all your speaking turns.")
+
+    await db.debate_rooms.update_one(
+        {"id": data.roomId},
+        {"$set": {"micHolder": data.side}}
+    )
+    
+    await manager.broadcast(data.roomId, {
+        "type": "mic_update",
+        "micHolder": data.side,
+        "turnsUsed": turns_used,
+        "status": "live"
+    })
+    return {"success": True}
+
+@api_router.post("/debate/mic/release")
+async def release_mic(data: MicActionRequest, current_user: dict = Depends(get_current_user)):
+    room = await db.debate_rooms.find_one({"id": data.roomId})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+        
+    await db.debate_rooms.update_one(
+        {"id": data.roomId},
+        {"$set": {"micHolder": None}}
+    )
+    
+    turns_used = room.get("turnsUsed", {"A": 0, "B": 0})
+    await manager.broadcast(data.roomId, {
+        "type": "mic_update",
+        "micHolder": None,
+        "turnsUsed": turns_used,
+        "status": room.get("status", "live")
+    })
+    return {"success": True}
+
+# ============= TRANSCRIPT AND AUDIO SERVICE =============
+
+@api_router.post("/debate/audio/upload")
+async def upload_audio(
+    roomId: str = Form(...),
+    participantName: str = Form(...),
+    side: str = Form(...),
+    textFallback: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    room = await db.debate_rooms.find_one({"id": roomId})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room["status"] != "live":
+        raise HTTPException(status_code=400, detail="Debate is not live.")
+
+    turns_used = room.get("turnsUsed", {"A": 0, "B": 0})
+    max_turns = room.get("maxTurnsPerSide", 5)
+    speaker_side = side.upper()
+
+    if turns_used.get(speaker_side, 0) >= max_turns:
+        raise HTTPException(status_code=400, detail="You have exhausted all your speaking turns.")
+
+    # Save audio temporarily
+    audio_dir = ROOT_DIR / "static" / "audio"
+    os.makedirs(audio_dir, exist_ok=True)
+    temp_id = str(uuid.uuid4())
+    ext = os.path.splitext(file.filename)[1] or ".wav"
+    temp_path = audio_dir / f"temp_{temp_id}{ext}"
+
+    async with aiofiles.open(temp_path, "wb") as f:
+        while chunk := await file.read(1024 * 1024):
+            await f.write(chunk)
+
+    # Convert voice/audio to text using Python Speech-To-Text (faster-whisper)
+    try:
+        text = await anyio.to_thread.run_sync(transcribe_audio, str(temp_path))
+    except Exception as e:
+        logging.error(f"Speech conversion failed: {e}")
+        text = ""
+    finally:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
+    text = text.strip()
+    if not text:
+        # Fallback to frontend Web Speech transcription text if provided
+        if textFallback:
+            text = textFallback.strip()
+        else:
+            text = "[Audio input detected, transcription empty]"
+
+    # Insert transcript entry
+    entry = {
+        "id": str(uuid.uuid4()),
+        "roomId": roomId,
+        "participantId": current_user["id"],
+        "participantName": participantName or current_user["name"],
+        "side": speaker_side,
+        "message": text,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    await db.debate_transcripts.insert_one(entry)
+
+    # Update turns used
+    new_turns_used = dict(turns_used)
+    new_turns_used[speaker_side] = new_turns_used.get(speaker_side, 0) + 1
+
+    # Check if debate is fully complete (both sides finished 5 turns)
+    a_done = new_turns_used.get("A", 0) >= max_turns
+    b_done = new_turns_used.get("B", 0) >= max_turns
+    debate_complete = a_done and b_done
+
+    update_fields = {
+        "turnsUsed": new_turns_used,
+        "micHolder": None
+    }
+
+    if debate_complete:
+        update_fields["status"] = "completed"
+        update_fields["endedAt"] = datetime.now(timezone.utc).isoformat()
+
+    await db.debate_rooms.update_one(
+        {"id": roomId},
+        {"$set": update_fields}
+    )
+
+    # Broadcast state update to WebSocket
+    await manager.broadcast(roomId, {
+        "type": "state_update",
+        "micHolder": None,
+        "turnsUsed": new_turns_used,
+        "status": "completed" if debate_complete else "live"
+    })
+
+    # Trigger auto-evaluation if complete
+    auto_evaluated = False
+    if debate_complete:
+        try:
+            await run_ai_evaluation(roomId, room)
+            auto_evaluated = True
+        except Exception as e:
+            logging.error(f"Auto-evaluation error: {str(e)}")
+
+    return {
+        "success": True,
+        "entryId": entry["id"],
+        "transcribedText": text,
+        "turnsUsed": new_turns_used,
+        "debateComplete": debate_complete,
+        "autoEvaluated": auto_evaluated
+    }
 
 @api_router.post("/debate/transcript/add")
 async def add_transcript(data: AddTranscriptRequest, current_user: dict = Depends(get_current_user)):
@@ -261,26 +537,14 @@ async def add_transcript(data: AddTranscriptRequest, current_user: dict = Depend
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
     if room["status"] != "live":
-        raise HTTPException(status_code=400, detail="Debate is not live. Cannot submit statements.")
+        raise HTTPException(status_code=400, detail="Debate is not live.")
 
-    # --- Turn-based enforcement ---
-    current_turn = room.get("currentTurn", "A")
     turns_used = room.get("turnsUsed", {"A": 0, "B": 0})
-    max_turns = room.get("maxTurnsPerSide", 2)
+    max_turns = room.get("maxTurnsPerSide", 5)
     speaker_side = data.side.upper()
 
-    if speaker_side != current_turn:
-        other = "Side A" if current_turn == "A" else "Side B"
-        raise HTTPException(
-            status_code=400,
-            detail=f"It is not your turn. Please wait for {other} to finish speaking."
-        )
-
     if turns_used.get(speaker_side, 0) >= max_turns:
-        raise HTTPException(
-            status_code=400,
-            detail=f"You have used all your {max_turns} chances."
-        )
+        raise HTTPException(status_code=400, detail=f"You have used all your {max_turns} chances.")
 
     # Insert transcript entry
     entry = {
@@ -298,17 +562,13 @@ async def add_transcript(data: AddTranscriptRequest, current_user: dict = Depend
     new_turns_used = dict(turns_used)
     new_turns_used[speaker_side] = new_turns_used.get(speaker_side, 0) + 1
 
-    # Determine next turn (alternate sides)
-    next_turn = "B" if speaker_side == "A" else "A"
-
-    # Check if debate is fully complete (both sides used all turns)
     a_done = new_turns_used.get("A", 0) >= max_turns
     b_done = new_turns_used.get("B", 0) >= max_turns
     debate_complete = a_done and b_done
 
     update_fields = {
         "turnsUsed": new_turns_used,
-        "currentTurn": next_turn
+        "micHolder": None
     }
 
     if debate_complete:
@@ -320,72 +580,18 @@ async def add_transcript(data: AddTranscriptRequest, current_user: dict = Depend
         {"$set": update_fields}
     )
 
-    # Auto-trigger AI evaluation when debate is complete
+    # Broadcast state update to WebSocket
+    await manager.broadcast(data.roomId, {
+        "type": "state_update",
+        "micHolder": None,
+        "turnsUsed": new_turns_used,
+        "status": "completed" if debate_complete else "live"
+    })
+
     auto_evaluated = False
     if debate_complete:
         try:
-            transcripts = await db.debate_transcripts.find(
-                {"roomId": data.roomId}, {"_id": 0}
-            ).sort("timestamp", 1).to_list(2000)
-
-            sideA_entries = [t for t in transcripts if t["side"] == "A"]
-            sideB_entries = [t for t in transcripts if t["side"] == "B"]
-            sideA_label = room.get("sideALabel", "Side A")
-            sideB_label = room.get("sideBLabel", "Side B")
-
-            def fmt(entries, label):
-                if not entries:
-                    return f"[{label} did not speak]"
-                return "\n".join([f"[{e['participantName']}]: {e['message']}" for e in entries])
-
-            prompt = DEBATE_JUDGE_PROMPT.format(
-                topic=room["topic"],
-                sideALabel=sideA_label,
-                sideBLabel=sideB_label,
-                sideA_transcript=fmt(sideA_entries, sideA_label),
-                sideB_transcript=fmt(sideB_entries, sideB_label)
-            )
-
-            gemini_client = genai.Client(api_key=os.environ.get('GOOGLE_GEMINI_API_KEY'))
-            response = await gemini_client.aio.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction="You are a neutral AI debate judge. Return only valid JSON exactly as instructed."
-                )
-            )
-            raw = response.text.strip()
-            if raw.startswith("```json"):
-                raw = raw[7:]
-            if raw.startswith("```"):
-                raw = raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            raw = raw.strip()
-            result = json.loads(raw)
-
-            eval_id = str(uuid.uuid4())
-            eval_doc = {
-                "id": eval_id,
-                "roomId": data.roomId,
-                "topic": room["topic"],
-                "sideALabel": sideA_label,
-                "sideBLabel": sideB_label,
-                "sideA": result.get("sideA", {}),
-                "sideB": result.get("sideB", {}),
-                "winner": result.get("winner", ""),
-                "reason": result.get("reason", ""),
-                "finalVerdict": result.get("final_verdict", ""),
-                "transcriptCount": len(transcripts),
-                "createdAt": datetime.now(timezone.utc).isoformat()
-            }
-            await db.debate_feedback.update_one(
-                {"roomId": data.roomId}, {"$set": eval_doc}, upsert=True
-            )
-            await db.debate_rooms.update_one(
-                {"id": data.roomId},
-                {"$set": {"evaluated": True, "evaluationId": eval_id}}
-            )
+            await run_ai_evaluation(data.roomId, room)
             auto_evaluated = True
         except Exception as e:
             logging.error(f"Auto-evaluation error: {str(e)}")
@@ -393,7 +599,6 @@ async def add_transcript(data: AddTranscriptRequest, current_user: dict = Depend
     return {
         "success": True,
         "entryId": entry["id"],
-        "nextTurn": next_turn,
         "turnsUsed": new_turns_used,
         "debateComplete": debate_complete,
         "autoEvaluated": auto_evaluated
@@ -406,72 +611,149 @@ async def get_transcripts(room_id: str, current_user: dict = Depends(get_current
     ).sort("timestamp", 1).to_list(2000)
     return entries
 
-# ============= AI EVALUATION =============
+# ============= WAPI AI JUDGE INTEGRATION =============
 
-DEBATE_JUDGE_PROMPT = """You are a neutral third-party AI judge in a two-person debate.
-
-STRICT RULES:
-
-PHASE 1 — LISTENING
-- Do NOT interrupt.
-- Do NOT give opinions.
-- Do NOT give hints.
-- Do NOT judge early.
-- Only observe arguments, logic, contradictions, rebuttals, clarity, and evidence.
-
-PHASE 2 — COMPLETION DETECTION
-- The debate is now complete as explicitly indicated by the host.
-
-PHASE 3 — JUDGMENT
-After completion, analyze both sides fairly.
-
-Evaluation Criteria:
-- Logical reasoning
-- Clarity
-- Consistency
-- Evidence quality
-- Counter-arguments
-- Contradictions
-- Overall persuasion
-
-IMPORTANT:
-- Be unbiased.
-- Do not try to satisfy both sides.
-- Choose a clear winner if one side is stronger.
-- Declare a tie ONLY if both sides are equally strong.
-- Call out weak logic and fallacies directly.
-- Keep explanations concise and professional.
+DEBATE_JUDGE_PROMPT = """You are a neutral third-party AI debate judge.
+Analyze the following debate topic and transcripts for the two participants.
 
 DEBATE TOPIC: {topic}
 
-{sideALabel} ARGUMENTS:
-{sideA_transcript}
+PARTICIPANTS:
+Side A: {participantA} ({sideALabel})
+Side B: {participantB} ({sideBLabel})
 
-{sideBLabel} ARGUMENTS:
-{sideB_transcript}
+TRANSCRIPT:
+{transcript_text}
 
-OUTPUT FORMAT (STRICT JSON — return ONLY this JSON, no markdown, no extra text):
+You must evaluate both participants.
+Calculate:
+1. winner: The participant's name (e.g. "{participantA}" or "{participantB}") or "Tie".
+2. scores: Out of 10 (integer) for each participant.
+3. communication_quality: Out of 10 (integer) for each participant.
+4. argument_strength: Out of 10 (integer) for each participant.
+5. logical_consistency: Out of 10 (integer) for each participant.
+6. confidence level: percentage (integer, 0 to 100).
+7. reasoning: a summary explaining the winner, score rationale, and details of argument strength and communication quality.
 
+STRICT RULE: You must return ONLY a valid JSON object matching the following format exactly. Do not include markdown code blocks, do not include any extra text.
+
+Response format:
 {{
-  "sideA": {{
-    "summary": "",
-    "strengths": [],
-    "weaknesses": [],
-    "score": 0
+  "winner": "{participantA}",
+  "scores": {{
+    "{participantA}": 9,
+    "{participantB}": 7
   }},
-  "sideB": {{
-    "summary": "",
-    "strengths": [],
-    "weaknesses": [],
-    "score": 0
+  "communication_quality": {{
+    "{participantA}": 8,
+    "{participantB}": 7
   }},
-  "winner": "Side A / Side B / Tie",
-  "reason": "",
-  "final_verdict": ""
+  "argument_strength": {{
+    "{participantA}": 9,
+    "{participantB}": 6
+  }},
+  "logical_consistency": {{
+    "{participantA}": 8,
+    "{participantB}": 7
+  }},
+  "reasoning": "Ali presented stronger logical arguments with better rebuttals and clearer communication.",
+  "confidence": 92
 }}
+"""
 
-Scores are integers from 0 to 100."""
+async def run_ai_evaluation(roomId: str, room: dict):
+    transcripts = await db.debate_transcripts.find(
+        {"roomId": roomId}, {"_id": 0}
+    ).sort("timestamp", 1).to_list(2000)
 
+    participants = room.get("participants", [])
+    partA = next((p for p in participants if p["side"] == "A"), None)
+    partB = next((p for p in participants if p["side"] == "B"), None)
+
+    nameA = partA["name"] if partA else "Side A"
+    nameB = partB["name"] if partB else "Side B"
+
+    def fmt(entries, name):
+        if not entries:
+            return f"[{name} did not speak]"
+        return "\n".join([f"[{e['participantName']}]: {e['message']}" for e in entries])
+
+    sideA_entries = [t for t in transcripts if t["side"] == "A"]
+    sideB_entries = [t for t in transcripts if t["side"] == "B"]
+
+    transcript_text = fmt(sideA_entries, nameA) + "\n\n" + fmt(sideB_entries, nameB)
+
+    prompt = DEBATE_JUDGE_PROMPT.format(
+        topic=room["topic"],
+        participantA=nameA,
+        participantB=nameB,
+        sideALabel=room.get("sideALabel", "Side A"),
+        sideBLabel=room.get("sideBLabel", "Side B"),
+        transcript_text=transcript_text
+    )
+
+    gemini_client = genai.Client(api_key=os.environ.get('GOOGLE_GEMINI_API_KEY'))
+    response = await gemini_client.aio.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            system_instruction="You are a neutral AI debate judge. Return only valid JSON exactly as instructed."
+        )
+    )
+    raw = response.text.strip()
+    if raw.startswith("```json"):
+        raw = raw[7:]
+    if raw.startswith("```"):
+        raw = raw[3:]
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    raw = raw.strip()
+    result = json.loads(raw)
+
+    # Convert AI Reasoning text into voice/audio
+    reasoning_text = result.get("reasoning", "")
+    audio_filename = f"{roomId}_result.wav"
+    audio_path = ROOT_DIR / "static" / "audio" / audio_filename
+
+    await generate_tts_audio(reasoning_text, str(audio_path))
+
+    # Check if pyttsx3 or gtts saved as .mp3
+    audio_relative_path = f"/static/audio/{audio_filename}"
+    if not os.path.exists(audio_path) and os.path.exists(str(audio_path).replace(".wav", ".mp3")):
+        audio_relative_path = f"/static/audio/{roomId}_result.mp3"
+
+    eval_id = str(uuid.uuid4())
+    eval_doc = {
+        "id": eval_id,
+        "roomId": roomId,
+        "topic": room["topic"],
+        "winner": result.get("winner", ""),
+        "scores": result.get("scores", {}),
+        "communication_quality": result.get("communication_quality", {}),
+        "argument_strength": result.get("argument_strength", {}),
+        "logical_consistency": result.get("logical_consistency", {}),
+        "reasoning": result.get("reasoning", ""),
+        "confidence": result.get("confidence", 100),
+        "audioPath": audio_relative_path,
+        "createdAt": datetime.now(timezone.utc).isoformat()
+    }
+
+    await db.debate_feedback.update_one(
+        {"roomId": roomId}, {"$set": eval_doc}, upsert=True
+    )
+
+    await db.debate_rooms.update_one(
+        {"id": roomId},
+        {"$set": {"evaluated": True, "evaluationId": eval_id}}
+    )
+
+    # Broadcast evaluated state to room clients
+    await manager.broadcast(roomId, {
+        "type": "state_update",
+        "status": "completed",
+        "evaluated": True,
+        "evaluationId": eval_id
+    })
 
 @api_router.post("/debate/evaluate")
 async def evaluate_debate(data: EvaluateRequest, current_user: dict = Depends(get_current_user)):
@@ -482,92 +764,17 @@ async def evaluate_debate(data: EvaluateRequest, current_user: dict = Depends(ge
         if room["createdBy"] != current_user["id"]:
             raise HTTPException(status_code=403, detail="Only the room creator can trigger evaluation")
 
-        transcripts = await db.debate_transcripts.find(
-            {"roomId": data.roomId}, {"_id": 0}
-        ).sort("timestamp", 1).to_list(2000)
-
-        if not transcripts:
-            raise HTTPException(status_code=400, detail="No transcript entries found for this room")
-
-        sideA_entries = [t for t in transcripts if t["side"] == "A"]
-        sideB_entries = [t for t in transcripts if t["side"] == "B"]
-
-        sideA_label = room.get("sideALabel", "Side A")
-        sideB_label = room.get("sideBLabel", "Side B")
-
-        def fmt(entries, label):
-            if not entries:
-                return f"[{label} did not speak]"
-            return "\n".join([f"[{e['participantName']}]: {e['message']}" for e in entries])
-
-        prompt = DEBATE_JUDGE_PROMPT.format(
-            topic=room["topic"],
-            sideALabel=sideA_label,
-            sideBLabel=sideB_label,
-            sideA_transcript=fmt(sideA_entries, sideA_label),
-            sideB_transcript=fmt(sideB_entries, sideB_label)
-        )
-
-        gemini_client = genai.Client(api_key=os.environ.get('GOOGLE_GEMINI_API_KEY'))
-        response = await gemini_client.aio.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                system_instruction="You are a neutral AI debate judge. Return only valid JSON exactly as instructed."
-            )
-        )
-        raw = response.text.strip()
-
-        # Strip markdown blocks if present
-        if raw.startswith("```json"):
-            raw = raw[7:]
-        if raw.startswith("```"):
-            raw = raw[3:]
-        if raw.endswith("```"):
-            raw = raw[:-3]
-        raw = raw.strip()
-
-        result = json.loads(raw)
-
-        eval_id = str(uuid.uuid4())
-        eval_doc = {
-            "id": eval_id,
-            "roomId": data.roomId,
-            "topic": room["topic"],
-            "sideALabel": sideA_label,
-            "sideBLabel": sideB_label,
-            "sideA": result.get("sideA", {}),
-            "sideB": result.get("sideB", {}),
-            "winner": result.get("winner", ""),
-            "reason": result.get("reason", ""),
-            "finalVerdict": result.get("final_verdict", ""),
-            "transcriptCount": len(transcripts),
-            "createdAt": datetime.now(timezone.utc).isoformat()
-        }
-        await db.debate_feedback.update_one(
-            {"roomId": data.roomId}, {"$set": eval_doc}, upsert=True
-        )
-        await db.debate_rooms.update_one(
-            {"id": data.roomId},
-            {"$set": {"evaluated": True, "evaluationId": eval_id}}
-        )
-        return {"success": True, "evaluationId": eval_id, "result": result}
-
-    except json.JSONDecodeError as e:
-        logging.error(f"JSON parse error: {e}")
-        raise HTTPException(status_code=500, detail="AI returned invalid JSON. Please try again.")
+        await run_ai_evaluation(data.roomId, room)
+        fb = await db.debate_feedback.find_one({"roomId": data.roomId}, {"_id": 0})
+        return {"success": True, "evaluationId": fb["id"], "result": fb}
     except Exception as e:
         logging.error(f"Evaluation error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @api_router.get("/debate/feedback/{room_id}")
 async def get_feedback(room_id: str, current_user: dict = Depends(get_current_user)):
     fb = await db.debate_feedback.find_one({"roomId": room_id}, {"_id": 0})
-    if not fb:
-        return None
     return fb
-
 
 @api_router.get("/debate/results/{room_id}")
 async def get_results(room_id: str, current_user: dict = Depends(get_current_user)):
@@ -575,21 +782,37 @@ async def get_results(room_id: str, current_user: dict = Depends(get_current_use
     if not fb:
         raise HTTPException(status_code=404, detail="Results not available yet. Run evaluation first.")
     room = await db.debate_rooms.find_one({"id": room_id}, {"_id": 0})
+    
+    participants = room.get("participants", [])
+    partA = next((p for p in participants if p["side"] == "A"), None)
+    partB = next((p for p in participants if p["side"] == "B"), None)
+
+    nameA = partA["name"] if partA else "Side A"
+    nameB = partB["name"] if partB else "Side B"
+
+    scores = fb.get("scores", {})
+    scoreA = scores.get(nameA, scores.get("Side A", 0))
+    scoreB = scores.get(nameB, scores.get("Side B", 0))
+
+    winner = fb.get("winner", "")
+
     return {
         "room": room,
         "feedback": fb,
         "leaderboard": [
             {
                 "side": "A",
-                "label": fb.get("sideALabel", "Side A"),
-                "score": fb.get("sideA", {}).get("score", 0),
-                "isWinner": "Side A" in fb.get("winner", "")
+                "label": room.get("sideALabel", "Side A"),
+                "name": nameA,
+                "score": scoreA,
+                "isWinner": nameA == winner or winner == "Side A"
             },
             {
                 "side": "B",
-                "label": fb.get("sideBLabel", "Side B"),
-                "score": fb.get("sideB", {}).get("score", 0),
-                "isWinner": "Side B" in fb.get("winner", "")
+                "label": room.get("sideBLabel", "Side B"),
+                "name": nameB,
+                "score": scoreB,
+                "isWinner": nameB == winner or winner == "Side B"
             }
         ]
     }
@@ -605,6 +828,19 @@ async def health():
     return {"status": "healthy"}
 
 app.include_router(api_router)
+
+# Mount Static serving
+app.mount("/static", StaticFiles(directory=str(ROOT_DIR / "static")), name="static")
+
+# WebSocket Endpoint
+@app.websocket("/ws/{room_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str):
+    await manager.connect(room_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(room_id, websocket)
 
 app.add_middleware(
     CORSMiddleware,

@@ -15,22 +15,21 @@ const SideBadge = ({ side, label }) => {
   );
 };
 
-// Mic indicator: shows ON AIR when it's this side's turn
-const MicIndicator = ({ isMyTurn, side, turnsUsed, maxTurns }) => {
+const MicIndicator = ({ isLocked, side, turnsUsed, maxTurns }) => {
   const used = turnsUsed?.[side] ?? 0;
   const dots = Array.from({ length: maxTurns }, (_, i) => i < used);
   const accentOn = side === 'A' ? 'text-blue-300 border-blue-500/60 bg-blue-500/20' : 'text-violet-300 border-violet-500/60 bg-violet-500/20';
   const accentOff = 'text-slate-500 border-slate-700 bg-slate-800/40';
 
   return (
-    <div className={`flex flex-col items-center gap-1.5 px-3 py-2 rounded-xl border transition-all duration-300 ${isMyTurn ? accentOn : accentOff}`}>
+    <div className={`flex flex-col items-center gap-1.5 px-3 py-2 rounded-xl border transition-all duration-300 ${isLocked ? accentOn : accentOff}`}>
       <div className="relative">
-        <svg className={`w-5 h-5 ${isMyTurn ? (side === 'A' ? 'text-blue-400' : 'text-violet-400') : 'text-slate-600'}`}
+        <svg className={`w-5 h-5 ${isLocked ? (side === 'A' ? 'text-blue-400' : 'text-violet-400') : 'text-slate-600'}`}
           fill="currentColor" viewBox="0 0 24 24">
           <path d="M12 1a4 4 0 0 1 4 4v6a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4zm6 9a1 1 0 0 1 2 0 8 8 0 0 1-7 7.938V20h2a1 1 0 0 1 0 2H9a1 1 0 0 1 0-2h2v-2.062A8 8 0 0 1 4 10a1 1 0 0 1 2 0 6 6 0 0 0 12 0z"/>
         </svg>
-        {isMyTurn && (
-          <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse border border-slate-900" />
+        {isLocked && (
+          <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse border border-slate-900" />
         )}
       </div>
       <div className="flex gap-1">
@@ -38,7 +37,7 @@ const MicIndicator = ({ isMyTurn, side, turnsUsed, maxTurns }) => {
           <span key={i} className={`w-2 h-2 rounded-full transition-all ${used_ ? (side === 'A' ? 'bg-blue-400' : 'bg-violet-400') : 'bg-slate-700'}`} />
         ))}
       </div>
-      {isMyTurn && <span className="text-[10px] font-bold tracking-widest text-emerald-400">ON AIR</span>}
+      {isLocked && <span className="text-[10px] font-bold tracking-widest text-red-400">SPEAKING</span>}
     </div>
   );
 };
@@ -50,51 +49,111 @@ const DebateRoom = () => {
 
   const [room, setRoom] = useState(null);
   const [transcripts, setTranscripts] = useState([]);
-  const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
   const [autoEvalLoading, setAutoEvalLoading] = useState(false);
+  
+  // Mic Recording States
+  const [recording, setRecording] = useState(false);
+  const [mediaRecorder, setMediaRecorder] = useState(null);
+  const [recordingTime, setRecordingTime] = useState(0);
+
   const feedRef = useRef(null);
   const pollRef = useRef(null);
+  const timerRef = useRef(null);
+  const socketRef = useRef(null);
 
   const isCreator = room?.createdBy === user?.id;
   const myParticipant = room?.participants?.find(p => p.userId === user?.id);
   const mySide = myParticipant?.side || 'A';
   const myName = myParticipant?.name || user?.name || 'Me';
 
-  const currentTurn = room?.currentTurn || 'A';
+  const micHolder = room?.micHolder || null; // null | 'A' | 'B'
   const turnsUsed = room?.turnsUsed || { A: 0, B: 0 };
-  const maxTurns = room?.maxTurnsPerSide || 2;
-  const isMyTurn = room?.status === 'live' && currentTurn === mySide;
-  const myTurnsLeft = maxTurns - (turnsUsed[mySide] || 0);
-  const myTurnsExhausted = myTurnsLeft <= 0;
+  const maxTurns = room?.maxTurnsPerSide || 5;
+  const turnsLeft = maxTurns - (turnsUsed[mySide] || 0);
+  const turnsExhausted = turnsLeft <= 0;
 
   const fetchRoom = useCallback(async () => {
-    const res = await api.get(`/debate/room/${id}`);
-    setRoom(res.data);
+    try {
+      const res = await api.get(`/debate/room/${id}`);
+      setRoom(res.data);
+    } catch (err) {
+      console.error(err);
+    }
   }, [id]);
 
   const fetchTranscripts = useCallback(async () => {
-    const res = await api.get(`/debate/transcripts/${id}`);
-    setTranscripts(res.data || []);
+    try {
+      const res = await api.get(`/debate/transcripts/${id}`);
+      setTranscripts(res.data || []);
+    } catch (err) {
+      console.error(err);
+    }
   }, [id]);
 
+  // WebSocket connection for real-time events
+  useEffect(() => {
+    const backendUrl = process.env.REACT_APP_BACKEND_URL || 'http://localhost:8000';
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = backendUrl.replace(/^https?:/, wsProto) + `/ws/${id}`;
+
+    const connectWebSocket = () => {
+      const ws = new WebSocket(wsUrl);
+      socketRef.current = ws;
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'state_update' || data.type === 'mic_update') {
+            fetchRoom();
+            fetchTranscripts();
+          }
+        } catch (err) {
+          console.error("WS Parse error:", err);
+        }
+      };
+
+      ws.onclose = () => {
+        console.warn("WebSocket closed. Attempting reconnect in 3s...");
+        setTimeout(() => {
+          if (socketRef.current === ws) {
+            connectWebSocket();
+          }
+        }, 3000);
+      };
+    };
+
+    connectWebSocket();
+
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.close();
+      }
+    };
+  }, [id, fetchRoom, fetchTranscripts]);
+
+  // Combined fetch on start
   useEffect(() => {
     Promise.all([fetchRoom(), fetchTranscripts()]).finally(() => setLoading(false));
   }, [fetchRoom, fetchTranscripts]);
 
+  // Polling fallback
   useEffect(() => {
     if (room?.status === 'live') {
-      pollRef.current = setInterval(() => { fetchTranscripts(); fetchRoom(); }, 3000);
+      pollRef.current = setInterval(() => {
+        fetchTranscripts();
+        fetchRoom();
+      }, 3000);
     } else {
       clearInterval(pollRef.current);
     }
     return () => clearInterval(pollRef.current);
   }, [room?.status, fetchTranscripts, fetchRoom]);
 
-  // Auto-redirect when debate is completed and evaluated
+  // Auto-redirect to results
   useEffect(() => {
     if (room?.status === 'completed' && room?.evaluated) {
       setAutoEvalLoading(false);
@@ -103,7 +162,7 @@ const DebateRoom = () => {
     }
   }, [room?.status, room?.evaluated, id, navigate]);
 
-  // Poll faster when autoEvalLoading
+  // Faster polling when waiting for AI verdict
   useEffect(() => {
     if (!autoEvalLoading) return;
     const fast = setInterval(() => { fetchRoom(); }, 2000);
@@ -115,41 +174,166 @@ const DebateRoom = () => {
   }, [transcripts]);
 
   const handleStart = async () => {
-    try { await api.post('/debate/start-room', { roomId: id }); await fetchRoom(); }
-    catch (err) { setError(err.response?.data?.detail || 'Failed to start.'); }
+    try { 
+      await api.post('/debate/start-room', { roomId: id }); 
+      await fetchRoom(); 
+    } catch (err) { 
+      setError(err.response?.data?.detail || 'Failed to start.'); 
+    }
   };
 
   const handleEnd = async () => {
-    try { await api.post('/debate/end-room', { roomId: id }); await fetchRoom(); }
-    catch (err) { setError(err.response?.data?.detail || 'Failed to end.'); }
+    try { 
+      await api.post('/debate/end-room', { roomId: id }); 
+      await fetchRoom(); 
+    } catch (err) { 
+      setError(err.response?.data?.detail || 'Failed to end.'); 
+    }
   };
 
-  const handleSend = async () => {
-    const msg = message.trim();
-    if (!msg || !isMyTurn || myTurnsExhausted) return;
-    setSending(true); setError('');
+  const [liveTranscript, setLiveTranscript] = useState('');
+  const recognitionRef = useRef(null);
+  const finalSpeechTextRef = useRef('');
+
+  // Mic Activation / Speaking turn
+  const startRecording = async () => {
+    setError('');
+    setLiveTranscript('');
+    finalSpeechTextRef.current = '';
+    if (turnsExhausted) {
+      setError("You have no speaking turns left!");
+      return;
+    }
+    if (micHolder && micHolder !== mySide) {
+      setError("Mic is locked. Waiting for opponent to release.");
+      return;
+    }
+
     try {
-      const res = await api.post('/debate/transcript/add', {
-        roomId: id, participantName: myName, side: mySide, message: msg
+      // Request mic lock
+      await api.post('/debate/mic/acquire', {
+        roomId: id,
+        side: mySide,
+        participantName: myName
       });
-      setMessage('');
-      await fetchTranscripts();
-      await fetchRoom();
-      if (res.data?.debateComplete) {
-        setAutoEvalLoading(true);
+
+      // Initialize Web Speech API Recognition
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        const rec = new SpeechRecognition();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = 'en-US';
+        rec.onresult = (event) => {
+          let interimText = '';
+          let finalText = '';
+          for (let i = event.resultIndex; i < event.results.length; ++i) {
+            if (event.results[i].isFinal) {
+              finalText += event.results[i][0].transcript;
+            } else {
+              interimText += event.results[i][0].transcript;
+            }
+          }
+          const recognized = (finalText || interimText).trim();
+          if (recognized) {
+            setLiveTranscript(recognized);
+            finalSpeechTextRef.current = recognized;
+          }
+        };
+        rec.start();
+        recognitionRef.current = rec;
       }
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      const chunks = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: 'audio/wav' });
+        stream.getTracks().forEach(track => track.stop());
+
+        const formData = new FormData();
+        formData.append('roomId', id);
+        formData.append('participantName', myName);
+        formData.append('side', mySide);
+        formData.append('file', blob, 'recording.wav');
+        if (finalSpeechTextRef.current) {
+          formData.append('textFallback', finalSpeechTextRef.current);
+        }
+
+        setSending(true);
+        try {
+          const res = await api.post('/debate/audio/upload', formData, {
+            headers: { 'Content-Type': 'multipart/form-data' }
+          });
+          await fetchTranscripts();
+          await fetchRoom();
+          if (res.data?.debateComplete) {
+            setAutoEvalLoading(true);
+          }
+        } catch (err) {
+          setError(err.response?.data?.detail || 'Failed to process voice transcript.');
+        } finally {
+          setSending(false);
+        }
+      };
+
+      recorder.start();
+      setMediaRecorder(recorder);
+      setRecording(true);
+      setRecordingTime(0);
+
+      timerRef.current = setInterval(() => {
+        setRecordingTime(prev => prev + 1);
+      }, 1000);
+
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to submit.');
-    } finally { setSending(false); }
+      setError(err.response?.data?.detail || "Could not start recording. Make sure mic permission is granted.");
+    }
   };
 
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+  const stopRecording = async () => {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop();
+    }
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+    }
+    setRecording(false);
+
+    try {
+      // Release mic lock
+      await api.post('/debate/mic/release', {
+        roomId: id,
+        side: mySide,
+        participantName: myName
+      });
+    } catch (err) {
+      console.error("Failed to release mic lock:", err);
+    }
+  };
+
+  const formatTimer = (sec) => {
+    const mins = Math.floor(sec / 60);
+    const secs = sec % 60;
+    return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
   };
 
   const copyCode = () => {
     navigator.clipboard.writeText(room?.roomCode || '');
-    setCopied(true); setTimeout(() => setCopied(false), 2000);
+    setCopied(true); 
+    setTimeout(() => setCopied(false), 2000);
   };
 
   const fmtTime = (iso) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -179,7 +363,6 @@ const DebateRoom = () => {
     </div>
   );
 
-  // Auto-eval loading overlay
   if (autoEvalLoading || (room?.status === 'completed' && room?.evaluated)) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900 flex items-center justify-center">
@@ -191,7 +374,7 @@ const DebateRoom = () => {
           <p className="text-slate-400 text-sm max-w-xs">
             {room?.evaluated
               ? 'Redirecting you to the results page...'
-              : 'Both debaters have finished. The AI is now evaluating all arguments.'}
+              : 'Both debaters have finished all 5 turns. The AI is evaluating transcripts and rendering results.'}
           </p>
           <div className="w-12 h-12 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
         </div>
@@ -203,9 +386,9 @@ const DebateRoom = () => {
   const sideAP = room.participants?.find(p => p.side === 'A');
   const sideBP = room.participants?.find(p => p.side === 'B');
 
-  const turnLabel = currentTurn === 'A'
-    ? (sideAP?.name || room.sideALabel || 'Side A')
-    : (sideBP?.name || room.sideBLabel || 'Side B');
+  const otherSide = mySide === 'A' ? 'B' : 'A';
+  const isMicLockedByOther = micHolder && micHolder === otherSide;
+  const isMicHeldByMe = micHolder && micHolder === mySide;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900 flex flex-col">
@@ -259,14 +442,14 @@ const DebateRoom = () => {
               { p: sideAP, side: 'A', label: room.sideALabel, accent: 'blue' },
               { p: sideBP, side: 'B', label: room.sideBLabel, accent: 'violet' }
             ].map(({ p, side, label, accent }) => {
-              const isTurnSide = room.status === 'live' && currentTurn === side;
+              const isLocked = micHolder === side;
               return (
                 <div key={side} className={`flex-1 flex items-center gap-3 p-3 rounded-xl border transition-all duration-300 ${
-                  isTurnSide
-                    ? `border-${accent}-500/60 bg-${accent}-500/15 shadow-lg shadow-${accent}-500/10`
-                    : (mySide === side ? `border-${accent}-500/30 bg-${accent}-500/08` : 'border-slate-700 bg-slate-700/20')
+                  isLocked
+                    ? `border-${accent}-500 bg-${accent}-500/10 shadow-lg shadow-${accent}-500/15`
+                    : (mySide === side ? 'border-slate-600 bg-slate-700/25' : 'border-slate-800 bg-slate-800/10')
                 }`}>
-                  <div className={`w-9 h-9 rounded-full bg-${accent}-500/30 flex items-center justify-center text-${accent}-300 text-sm font-bold flex-shrink-0`}>
+                  <div className={`w-9 h-9 rounded-full bg-${accent}-500/20 flex items-center justify-center text-${accent}-300 text-sm font-bold flex-shrink-0`}>
                     {p?.name?.[0]?.toUpperCase() || side}
                   </div>
                   <div className="flex-1 min-w-0">
@@ -278,7 +461,7 @@ const DebateRoom = () => {
                   </div>
                   {room.status === 'live' && (
                     <MicIndicator
-                      isMyTurn={isTurnSide}
+                      isLocked={isLocked}
                       side={side}
                       turnsUsed={turnsUsed}
                       maxTurns={maxTurns}
@@ -292,19 +475,25 @@ const DebateRoom = () => {
           {/* Turn Banner */}
           {room.status === 'live' && (
             <div className={`mt-4 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold transition-all duration-300 ${
-              isMyTurn
-                ? 'bg-emerald-500/15 border border-emerald-500/40 text-emerald-300'
+              isMicHeldByMe
+                ? 'bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 animate-pulse'
+                : isMicLockedByOther
+                ? 'bg-red-500/15 border border-red-500/30 text-red-300'
                 : 'bg-slate-700/40 border border-slate-700 text-slate-400'
             }`}>
-              {isMyTurn ? (
+              {isMicHeldByMe ? (
                 <>
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                  🎤 It's your turn! Speak now — {myTurnsLeft} chance{myTurnsLeft !== 1 ? 's' : ''} left
+                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping" />
+                  🎤 You are speaking live! Keep holding mic or click release when finished.
+                </>
+              ) : isMicLockedByOther ? (
+                <>
+                  <span className="w-2.5 h-2.5 rounded-full bg-red-400" />
+                  🔒 Opponent is speaking. Your microphone is locked.
                 </>
               ) : (
                 <>
-                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-                  ⏳ Waiting for <strong className="text-white ml-1">{turnLabel}</strong> to speak...
+                  🎤 Microphone is free. Grab the mic and state your argument! ({turnsLeft} of {maxTurns} turns left)
                 </>
               )}
             </div>
@@ -319,11 +508,6 @@ const DebateRoom = () => {
               {room.status === 'live' && (
                 <Button onClick={handleEnd} variant="outline" className="border-red-500/50 text-red-400 hover:bg-red-500/10 rounded-xl">⏹ End Early</Button>
               )}
-            </div>
-          )}
-          {!isCreator && room.status === 'completed' && room.evaluated && (
-            <div className="mt-4 pt-4 border-t border-slate-700">
-              <Button onClick={() => navigate(`/debate/${id}/results`)} className="bg-gradient-to-r from-indigo-600 to-violet-600 text-white font-semibold rounded-xl">🏆 View Results</Button>
             </div>
           )}
         </div>
@@ -371,49 +555,78 @@ const DebateRoom = () => {
             })}
           </div>
 
-          {/* Input area */}
+          {/* Controlled Mic System UI */}
           {room.status === 'live' ? (
-            <div className="p-4 border-t border-slate-700">
-              {!isMyTurn ? (
-                <div className="flex items-center justify-center gap-3 py-4 rounded-xl bg-slate-700/30 border border-slate-700 text-slate-500 text-sm">
-                  <svg className="w-5 h-5 text-amber-500/70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <div className="p-6 border-t border-slate-700 bg-slate-900/40 flex flex-col items-center justify-center gap-4">
+              {sending && (
+                <div className="flex items-center gap-2 text-sm text-indigo-400 mb-2">
+                  <div className="w-4 h-4 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+                  <span>Converting local voice into text using faster-whisper...</span>
+                </div>
+              )}
+
+              {turnsExhausted ? (
+                <div className="text-center py-3 text-slate-400 text-sm font-semibold bg-slate-800/50 w-full rounded-xl border border-slate-700">
+                  ✅ You have used all 5 of your speaking turns. Waiting for other participant to finish.
+                </div>
+              ) : isMicLockedByOther ? (
+                <div className="text-center py-6 w-full flex flex-col items-center justify-center bg-red-950/20 border border-red-900/30 rounded-2xl text-slate-400">
+                  <svg className="w-8 h-8 text-red-500 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m0 0v2m0-2h2m-2 0H10M9 11V9a3 3 0 116 0v2M5 21h14a2 2 0 002-2v-1a7 7 0 00-14 0v1a2 2 0 002 2z" />
                   </svg>
-                  <span>Mic is locked — waiting for <strong className="text-slate-300">{turnLabel}</strong> to speak</span>
-                </div>
-              ) : myTurnsExhausted ? (
-                <div className="flex items-center justify-center gap-3 py-4 rounded-xl bg-slate-700/30 border border-slate-700 text-slate-500 text-sm">
-                  ✅ You've used all your chances. Waiting for the debate to complete...
+                  <p className="text-sm font-semibold text-red-400">Mic is Locked by Opponent</p>
+                  <p className="text-xs mt-1 text-slate-500">Wait for them to release the mic to speak.</p>
                 </div>
               ) : (
-                <div className="flex gap-3">
-                  <div className="flex-1">
-                    <textarea
-                      rows={2}
-                      value={message}
-                      onChange={e => setMessage(e.target.value)}
-                      onKeyDown={handleKeyDown}
-                      placeholder={`🎤 It's your turn! Type your argument... (${myTurnsLeft} chance${myTurnsLeft !== 1 ? 's' : ''} left)`}
-                      className="w-full bg-slate-700/50 border border-emerald-500/40 text-white placeholder-slate-500 rounded-xl px-4 py-3 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-emerald-500 transition-all"
-                    />
-                    <div className="flex items-center gap-2 mt-1">
-                      <span className="text-xs text-slate-600">Speaking as:</span>
-                      <SideBadge side={mySide} label={mySide === 'A' ? room.sideALabel : room.sideBLabel} />
-                      <span className="text-xs text-slate-600 ml-auto">
-                        {turnsUsed[mySide] || 0}/{maxTurns} turns used
-                      </span>
-                    </div>
-                  </div>
-                  <Button
-                    onClick={handleSend}
-                    disabled={sending || !message.trim()}
-                    className="self-start mt-0.5 bg-gradient-to-r from-emerald-600 to-indigo-600 hover:from-emerald-500 hover:to-indigo-500 text-white font-semibold px-5 rounded-xl disabled:opacity-40 h-10"
+                <div className="flex flex-col items-center gap-3">
+                  <button
+                    onClick={recording ? stopRecording : startRecording}
+                    disabled={sending}
+                    className={`w-24 h-24 rounded-full flex flex-col items-center justify-center transition-all duration-300 shadow-xl ${
+                      recording
+                        ? 'bg-red-500 hover:bg-red-600 animate-pulse text-white scale-105 ring-4 ring-red-500/20'
+                        : 'bg-indigo-600 hover:bg-indigo-500 text-white hover:scale-105 active:scale-95'
+                    } disabled:opacity-50`}
                   >
-                    {sending
-                      ? <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                      : <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
-                    }
-                  </Button>
+                    <svg className="w-10 h-10" fill="currentColor" viewBox="0 0 24 24">
+                      <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z" />
+                    </svg>
+                    <span className="text-[10px] font-bold tracking-widest mt-1">
+                      {recording ? 'RELEASE' : 'HOLD MIC'}
+                    </span>
+                  </button>
+
+                  {recording && (
+                    <div className="flex flex-col items-center gap-2 max-w-lg w-full">
+                      {liveTranscript && (
+                        <div className="bg-slate-800/90 border border-slate-700/60 rounded-2xl px-4 py-2 text-center text-xs text-emerald-300 font-medium max-w-md shadow-lg">
+                          🎙️ <span className="text-slate-400">Realtime Preview: </span>"{liveTranscript}"
+                        </div>
+                      )}
+                      <div className="flex items-center gap-1 mt-1 text-emerald-400 font-mono text-sm font-bold">
+                        <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                        <span>Recording: {formatTimer(recordingTime)}</span>
+                      </div>
+                      {/* Simple visualizer waves */}
+                      <div className="flex items-center gap-0.5 h-3 mt-1">
+                        {[1, 2, 3, 4, 5, 4, 3, 2, 1].map((h, i) => (
+                          <span
+                            key={i}
+                            className="w-0.5 bg-emerald-400 rounded-full animate-bounce"
+                            style={{
+                              height: `${h * 15}%`,
+                              animationDelay: `${i * 0.1}s`,
+                              animationDuration: '0.6s'
+                            }}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="text-xs text-slate-500 text-center">
+                    Turns Left: <strong className="text-white">{turnsLeft}</strong> / {maxTurns}
+                  </div>
                 </div>
               )}
             </div>
